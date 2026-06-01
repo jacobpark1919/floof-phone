@@ -3,32 +3,42 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>floof phone camera</title>
+    <title>floof WebRTC receiver</title>
     <style>
       body {
         margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+        min-height: 100vh;
         background: #111;
         color: #f4f7f8;
+        font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
         display: grid;
-        min-height: 100vh;
         place-items: center;
       }
 
       main {
-        width: min(520px, calc(100vw - 32px));
-        background: #171717;
-        border: 1px solid #2b2b2b;
-        border-radius: 14px;
-        padding: 24px;
-        box-sizing: border-box;
+        width: min(960px, calc(100vw - 32px));
       }
 
       video {
         width: 100%;
+        aspect-ratio: 16 / 9;
         background: #050505;
-        border-radius: 10px;
-        margin: 12px 0;
+        border: 1px solid #2b2b2b;
+        border-radius: 12px;
+        display: block;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+
+      h1 {
+        font-size: 20px;
+        margin: 0;
       }
 
       button {
@@ -37,10 +47,9 @@
         border-radius: 10px;
         background: #6aa7ff;
         color: #071017;
-        font-size: 17px;
+        font-size: 15px;
         font-weight: 700;
-        padding: 14px 18px;
-        width: 100%;
+        padding: 11px 16px;
       }
 
       p {
@@ -49,13 +58,6 @@
       }
 
       code {
-        display: block;
-        white-space: normal;
-        word-break: break-all;
-        background: #0c1012;
-        border: 1px solid #2b2b2b;
-        border-radius: 8px;
-        padding: 12px;
         color: #6aa7ff;
       }
 
@@ -67,37 +69,38 @@
       .err {
         color: #ef4444;
       }
-
-      .small {
-        font-size: 13px;
-      }
     </style>
   </head>
   <body>
     <main>
-      <h1>floof</h1>
-      <p>Start the camera to stream to the floof WebRTC receiver on your computer.</p>
-      <video id="preview" autoplay muted playsinline></video>
-      <button id="start">Start Camera</button>
-      <p id="status" class="small">Waiting for camera permission.</p>
-      <code id="session"></code>
+      <header>
+        <h1>floof WebRTC receiver</h1>
+        <button id="start">Start Receiver</button>
+      </header>
+      <video id="remote" autoplay muted playsinline controls></video>
+      <p id="status">Waiting. Session: <code id="session"></code></p>
     </main>
 
     <script>
       const params = new URLSearchParams(window.location.search);
       const session = params.get("session") || params.get("s") || "manual";
-      const video = document.getElementById("preview");
+      const remote = document.getElementById("remote");
       const button = document.getElementById("start");
       const status = document.getElementById("status");
       const sessionLabel = document.getElementById("session");
       const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
       let peer = null;
-      let answerApplied = false;
-      let offerPosted = false;
+      let offerApplied = false;
+      let answerPosted = false;
       let queuedCandidates = [];
-      const addedDesktopCandidates = new Set();
+      const addedPhoneCandidates = new Set();
 
-      sessionLabel.textContent = "Session: " + session;
+      sessionLabel.textContent = session;
+
+      function setStatus(message, kind = "") {
+        status.textContent = message + " Session: " + session;
+        status.className = kind;
+      }
 
       function candidateKey(candidate) {
         return [
@@ -136,11 +139,11 @@
       async function sendCandidate(candidate) {
         const payload = {
           type: "candidate",
-          role: "phone",
+          role: "desktop",
           candidate: candidate.toJSON ? candidate.toJSON() : candidate
         };
 
-        if (!offerPosted) {
+        if (!answerPosted) {
           queuedCandidates.push(payload);
           return;
         }
@@ -157,7 +160,7 @@
         }
       }
 
-      async function pollDesktopAnswer() {
+      async function pollPhoneOffer() {
         if (!peer) {
           return;
         }
@@ -165,85 +168,69 @@
         try {
           const state = await getSignal();
 
-          if (state.answer && !answerApplied) {
-            await peer.setRemoteDescription(state.answer);
-            answerApplied = true;
-            status.textContent = "WebRTC connected. Session: " + session;
-            status.className = "small ok";
+          if (state.offer && !offerApplied) {
+            await peer.setRemoteDescription(state.offer);
+            offerApplied = true;
+
+            const answer = await peer.createAnswer();
+            await peer.setLocalDescription(answer);
+            await postSignal({
+              type: "answer",
+              role: "desktop",
+              description: peer.localDescription
+            });
+
+            answerPosted = true;
+            await flushQueuedCandidates();
+            setStatus("Answer sent. Connecting.");
           }
 
-          for (const candidate of state.desktopCandidates || []) {
+          for (const candidate of state.phoneCandidates || []) {
             const key = candidateKey(candidate);
 
-            if (!addedDesktopCandidates.has(key)) {
-              addedDesktopCandidates.add(key);
+            if (!addedPhoneCandidates.has(key)) {
+              addedPhoneCandidates.add(key);
               await peer.addIceCandidate(candidate);
             }
           }
         } catch (error) {
-          status.textContent = "Signal error: " + (error.message || error.name);
-          status.className = "small err";
+          setStatus("Signal error: " + (error.message || error.name), "err");
         }
       }
 
       button.onclick = async () => {
         try {
           button.disabled = true;
-          button.textContent = "Starting";
-          status.textContent = "Opening camera.";
-          status.className = "small";
-
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: "environment",
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            },
-            audio: false
-          });
-
-          video.srcObject = stream;
+          button.textContent = "Receiver Running";
+          setStatus("Waiting for phone offer.");
 
           peer = new RTCPeerConnection({ iceServers });
+          peer.ontrack = (event) => {
+            if (event.streams && event.streams[0]) {
+              remote.srcObject = event.streams[0];
+            } else {
+              remote.srcObject = new MediaStream([event.track]);
+            }
+          };
           peer.oniceconnectionstatechange = () => {
-            status.textContent = "WebRTC " + peer.iceConnectionState + ". Session: " + session;
-            status.className = peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed"
-              ? "small ok"
-              : "small";
+            const state = peer.iceConnectionState;
+            const connected = state === "connected" || state === "completed";
+            setStatus("WebRTC " + state + ".", connected ? "ok" : "");
           };
           peer.onicecandidate = (event) => {
             if (event.candidate) {
               sendCandidate(event.candidate).catch((error) => {
-                status.textContent = "Candidate error: " + (error.message || error.name);
-                status.className = "small err";
+                setStatus("Candidate error: " + (error.message || error.name), "err");
               });
             }
           };
 
-          for (const track of stream.getTracks()) {
-            peer.addTrack(track, stream);
-          }
-
-          const offer = await peer.createOffer();
-          await peer.setLocalDescription(offer);
-          await postSignal({
-            type: "offer",
-            role: "phone",
-            description: peer.localDescription
-          });
-
-          offerPosted = true;
-          await flushQueuedCandidates();
-
-          button.textContent = "Streaming";
-          status.textContent = "Waiting for desktop receiver. Session: " + session;
-          status.className = "small";
-          setInterval(pollDesktopAnswer, 700);
+          setInterval(pollPhoneOffer, 700);
+          pollPhoneOffer();
         } catch (error) {
           button.disabled = false;
-          button.textContent = "Start Camera";
-          status.textContent = "Camera/WebRTC error: " + (error.message || error.name);
-          status.className = "small err";
+          button.textContent = "Start Receiver";
+          setStatus("Receiver error: " + (error.message || error.name), "err");
         }
       };
     </script>

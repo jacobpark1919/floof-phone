@@ -1,19 +1,20 @@
 # floof phone web
 
-This is the prototype HTTPS phone camera page for `floof`.
+This is the prototype HTTPS phone camera/WebRTC pairing site for `floof`.
 
 It is designed for Vercel:
 
-- `index.html` opens the iPhone camera over HTTPS
-- `api/frame.js` accepts JPEG frame uploads for a session
-- `package.json` installs Vercel's KV client for serverless frame storage
-- the desktop app polls `/api/frame?session=...` and displays the latest frame
+- `index.html` opens the iPhone camera over HTTPS and sends it with WebRTC
+- `desktop.html` receives and displays the WebRTC stream on the computer
+- `api/signal.js` stores temporary WebRTC offer/answer/ICE signaling messages
+- `api/frame.js` is the older JPEG relay fallback/prototype endpoint
+- `package.json` installs Vercel's KV client for serverless signaling storage
 
-This is a quick prototype relay. It is not the final low-latency WebRTC architecture.
+Vercel is only used for pairing/signaling. The WebRTC media path should connect peer-to-peer when the network allows it.
 
 ## Required Storage
 
-Vercel serverless functions do not reliably share in-memory state between requests, so the relay needs Redis/KV storage.
+Vercel serverless functions do not reliably share in-memory state between requests, so signaling needs Redis/KV storage.
 
 Create a Vercel KV / Upstash Redis database. Vercel may add these environment variables automatically:
 
@@ -34,7 +35,7 @@ UPSTASH_REDIS_REST_URL
 UPSTASH_REDIS_REST_TOKEN
 ```
 
-Without working KV variables, the phone page can open but frames will not reach the desktop app.
+Without working KV variables, the phone page can open but WebRTC pairing will not complete.
 
 ## Deploy
 
@@ -55,3 +56,13 @@ https://floof-phone.vercel.app
 ```
 
 If your Vercel URL changes, update `phoneCloudBaseUrl` in `src/MainComponent.cpp`.
+
+## WebRTC Flow
+
+1. In floof, choose `Phone as Webcam (WebRTC)`.
+2. floof opens `desktop.html?s=<session>` in the computer's browser.
+3. Scan the QR from floof with the iPhone.
+4. Tap `Start Camera`.
+5. Click `Start Receiver` in the desktop browser page if it has not already started.
+
+This first WebRTC milestone previews the phone camera in the browser receiver. It does not yet pipe decoded video frames into JUCE or record phone video into floof's timeline.
