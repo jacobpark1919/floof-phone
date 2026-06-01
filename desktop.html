@@ -95,6 +95,10 @@
       let offerApplied = false;
       let answerPosted = false;
       let queuedCandidates = [];
+      let remoteStream = null;
+      let mediaRecorder = null;
+      let recorderStopRequested = false;
+      let pendingChunkReads = 0;
       const addedPhoneCandidates = new Set();
 
       sessionLabel.textContent = session;
@@ -118,6 +122,127 @@
         status.textContent = message + " Session: " + session;
         status.className = kind;
       }
+
+      function emitToFloof(payload) {
+        if (window.__JUCE__ && window.__JUCE__.backend) {
+          window.__JUCE__.backend.emitEvent("floofWebRtcVideo", payload);
+        }
+      }
+
+      function getRecorderMimeType() {
+        const candidates = [
+          "video/webm;codecs=vp9",
+          "video/webm;codecs=vp8",
+          "video/webm"
+        ];
+
+        for (const mimeType of candidates) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(mimeType)) {
+            return mimeType;
+          }
+        }
+
+        return "";
+      }
+
+      function maybeEmitRecorderStopped() {
+        if (!recorderStopRequested || pendingChunkReads > 0) {
+          return;
+        }
+
+        recorderStopRequested = false;
+        mediaRecorder = null;
+        emitToFloof({ type: "stopped" });
+      }
+
+      window.floofStartWebRtcRecording = () => {
+        try {
+          if (!remoteStream) {
+            throw new Error("No WebRTC stream is connected yet");
+          }
+
+          if (!window.MediaRecorder) {
+            throw new Error("MediaRecorder is not available in this WebView");
+          }
+
+          if (mediaRecorder && mediaRecorder.state !== "inactive") {
+            return;
+          }
+
+          const mimeType = getRecorderMimeType();
+          mediaRecorder = mimeType
+            ? new MediaRecorder(remoteStream, { mimeType })
+            : new MediaRecorder(remoteStream);
+          recorderStopRequested = false;
+          pendingChunkReads = 0;
+
+          mediaRecorder.ondataavailable = (event) => {
+            if (!event.data || event.data.size === 0) {
+              return;
+            }
+
+            pendingChunkReads += 1;
+            const reader = new FileReader();
+            reader.onload = () => {
+              const result = String(reader.result || "");
+              const commaIndex = result.indexOf(",");
+              emitToFloof({
+                type: "chunk",
+                data: commaIndex >= 0 ? result.slice(commaIndex + 1) : result
+              });
+              pendingChunkReads -= 1;
+              maybeEmitRecorderStopped();
+            };
+            reader.onerror = () => {
+              pendingChunkReads -= 1;
+              emitToFloof({
+                type: "error",
+                message: "Could not read WebRTC recording chunk"
+              });
+              maybeEmitRecorderStopped();
+            };
+            reader.readAsDataURL(event.data);
+          };
+
+          mediaRecorder.onstop = () => {
+            recorderStopRequested = true;
+            maybeEmitRecorderStopped();
+          };
+
+          mediaRecorder.onerror = (event) => {
+            emitToFloof({
+              type: "error",
+              message: event.error ? event.error.message : "MediaRecorder error"
+            });
+          };
+
+          mediaRecorder.start(1000);
+          setStatus("Recording WebRTC video.", "ok");
+          emitToFloof({ type: "started" });
+        } catch (error) {
+          emitToFloof({
+            type: "error",
+            message: error.message || error.name
+          });
+        }
+      };
+
+      window.floofStopWebRtcRecording = () => {
+        try {
+          if (!mediaRecorder || mediaRecorder.state === "inactive") {
+            emitToFloof({ type: "stopped" });
+            return;
+          }
+
+          mediaRecorder.requestData();
+          mediaRecorder.stop();
+        } catch (error) {
+          emitToFloof({
+            type: "error",
+            message: error.message || error.name
+          });
+        }
+      };
 
       function candidateKey(candidate) {
         return [
@@ -224,9 +349,11 @@
           peer = new RTCPeerConnection({ iceServers });
           peer.ontrack = (event) => {
             if (event.streams && event.streams[0]) {
-              remote.srcObject = event.streams[0];
+              remoteStream = event.streams[0];
+              remote.srcObject = remoteStream;
             } else {
-              remote.srcObject = new MediaStream([event.track]);
+              remoteStream = new MediaStream([event.track]);
+              remote.srcObject = remoteStream;
             }
           };
           peer.oniceconnectionstatechange = () => {
