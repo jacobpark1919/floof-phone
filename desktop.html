@@ -84,6 +84,8 @@
     <script>
       const params = new URLSearchParams(window.location.search);
       const session = params.get("session") || params.get("s") || "manual";
+      const embed = params.get("embed") === "1";
+      const autoStart = params.get("auto") === "1";
       const remote = document.getElementById("remote");
       const button = document.getElementById("start");
       const status = document.getElementById("status");
@@ -96,6 +98,21 @@
       const addedPhoneCandidates = new Set();
 
       sessionLabel.textContent = session;
+
+      if (embed) {
+        document.body.style.placeItems = "stretch";
+        document.querySelector("main").style.width = "100%";
+        document.querySelector("main").style.minHeight = "100vh";
+        document.querySelector("main").style.display = "grid";
+        document.querySelector("main").style.gridTemplateRows = "auto 1fr auto";
+        document.querySelector("main").style.padding = "0";
+        document.querySelector("header").style.padding = "10px";
+        document.querySelector("header").style.marginBottom = "0";
+        remote.style.borderRadius = "0";
+        remote.style.borderLeft = "0";
+        remote.style.borderRight = "0";
+        status.style.padding = "0 10px 10px";
+      }
 
       function setStatus(message, kind = "") {
         status.textContent = message + " Session: " + session;
@@ -233,6 +250,12 @@
           setStatus("Receiver error: " + (error.message || error.name), "err");
         }
       };
+
+      if (autoStart) {
+        window.addEventListener("load", () => {
+          setTimeout(() => button.click(), 250);
+        });
+      }
     </script>
   </body>
 </html>
