@@ -98,7 +98,9 @@
       let remoteStream = null;
       let mediaRecorder = null;
       let recorderStopRequested = false;
+      let recorderStopGraceTimer = null;
       let pendingChunkReads = 0;
+      let recorderBytesSent = 0;
       const addedPhoneCandidates = new Set();
 
       sessionLabel.textContent = session;
@@ -150,14 +152,44 @@
           return;
         }
 
+        if (recorderStopGraceTimer) {
+          return;
+        }
+
         recorderStopRequested = false;
         mediaRecorder = null;
-        emitToFloof({ type: "stopped" });
+        setStatus("WebRTC video saved.", "ok");
+        emitToFloof({ type: "stopped", bytes: recorderBytesSent });
+      }
+
+      function scheduleRecorderStopped() {
+        if (recorderStopGraceTimer) {
+          clearTimeout(recorderStopGraceTimer);
+        }
+
+        recorderStopGraceTimer = setTimeout(() => {
+          recorderStopGraceTimer = null;
+          maybeEmitRecorderStopped();
+        }, 750);
+      }
+
+      function getActiveRemoteStream() {
+        if (remoteStream) {
+          return remoteStream;
+        }
+
+        if (remote.srcObject instanceof MediaStream) {
+          return remote.srcObject;
+        }
+
+        return null;
       }
 
       window.floofStartWebRtcRecording = () => {
         try {
-          if (!remoteStream) {
+          const streamToRecord = getActiveRemoteStream();
+
+          if (!streamToRecord) {
             throw new Error("No WebRTC stream is connected yet");
           }
 
@@ -169,18 +201,32 @@
             return;
           }
 
+          const liveVideoTracks = streamToRecord
+            .getVideoTracks()
+            .filter((track) => track.readyState === "live");
+
+          if (liveVideoTracks.length === 0) {
+            throw new Error("The connected phone stream has no live video track");
+          }
+
           const mimeType = getRecorderMimeType();
           mediaRecorder = mimeType
-            ? new MediaRecorder(remoteStream, { mimeType })
-            : new MediaRecorder(remoteStream);
+            ? new MediaRecorder(streamToRecord, { mimeType })
+            : new MediaRecorder(streamToRecord);
           recorderStopRequested = false;
+          if (recorderStopGraceTimer) {
+            clearTimeout(recorderStopGraceTimer);
+            recorderStopGraceTimer = null;
+          }
           pendingChunkReads = 0;
+          recorderBytesSent = 0;
 
           mediaRecorder.ondataavailable = (event) => {
             if (!event.data || event.data.size === 0) {
               return;
             }
 
+            recorderBytesSent += event.data.size;
             pendingChunkReads += 1;
             const reader = new FileReader();
             reader.onload = () => {
@@ -206,10 +252,17 @@
 
           mediaRecorder.onstop = () => {
             recorderStopRequested = true;
-            maybeEmitRecorderStopped();
+            setStatus("Finishing WebRTC video.", "ok");
+            scheduleRecorderStopped();
           };
 
           mediaRecorder.onerror = (event) => {
+            recorderStopRequested = false;
+            if (recorderStopGraceTimer) {
+              clearTimeout(recorderStopGraceTimer);
+              recorderStopGraceTimer = null;
+            }
+            mediaRecorder = null;
             emitToFloof({
               type: "error",
               message: event.error ? event.error.message : "MediaRecorder error"
@@ -230,7 +283,8 @@
       window.floofStopWebRtcRecording = () => {
         try {
           if (!mediaRecorder || mediaRecorder.state === "inactive") {
-            emitToFloof({ type: "stopped" });
+            recorderStopRequested = false;
+            emitToFloof({ type: "stopped", bytes: recorderBytesSent });
             return;
           }
 
