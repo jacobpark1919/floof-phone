@@ -43,6 +43,61 @@
         width: 100%;
       }
 
+      button.secondary {
+        background: #252c33;
+        color: #f4f7f8;
+      }
+
+      button.toggle-on {
+        background: #ffd166;
+        color: #171100;
+      }
+
+      button:disabled,
+      input:disabled,
+      select:disabled {
+        opacity: 0.55;
+      }
+
+      .controls {
+        display: none;
+        gap: 12px;
+        margin: 12px 0;
+      }
+
+      .controls.visible {
+        display: grid;
+      }
+
+      .control {
+        display: grid;
+        gap: 7px;
+      }
+
+      label {
+        color: #d7dde3;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      input,
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #343d46;
+        border-radius: 10px;
+        background: #0c1012;
+        color: #f4f7f8;
+        font-size: 16px;
+        min-height: 48px;
+        padding: 10px 12px;
+      }
+
+      input[type="range"] {
+        padding: 0;
+        accent-color: #6aa7ff;
+      }
+
       p {
         color: #aab2bd;
         line-height: 1.45;
@@ -78,6 +133,22 @@
       <h1>floof</h1>
       <p>Start the camera to stream to the floof WebRTC receiver on your computer.</p>
       <video id="preview" autoplay muted playsinline></video>
+      <div id="controls" class="controls" aria-label="Camera controls">
+        <button id="flip" class="secondary" type="button">Flip Camera</button>
+        <div class="control">
+          <label for="quality">Quality</label>
+          <select id="quality">
+            <option value="low">Low latency</option>
+            <option value="720p" selected>720p</option>
+            <option value="1080p">1080p</option>
+          </select>
+        </div>
+        <div id="zoomWrap" class="control" hidden>
+          <label for="zoom">Zoom</label>
+          <input id="zoom" type="range" min="1" max="1" step="0.1" value="1" />
+        </div>
+        <button id="torch" class="secondary" type="button" hidden>Torch Off</button>
+      </div>
       <button id="start">Start Camera</button>
       <p id="status" class="small">Waiting for camera permission.</p>
       <code id="session"></code>
@@ -90,8 +161,21 @@
       const button = document.getElementById("start");
       const status = document.getElementById("status");
       const sessionLabel = document.getElementById("session");
+      const controls = document.getElementById("controls");
+      const flipButton = document.getElementById("flip");
+      const qualitySelect = document.getElementById("quality");
+      const zoomWrap = document.getElementById("zoomWrap");
+      const zoomSlider = document.getElementById("zoom");
+      const torchButton = document.getElementById("torch");
       const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
       let peer = null;
+      let localStream = null;
+      let activeVideoTrack = null;
+      let videoSender = null;
+      let currentFacingMode = "environment";
+      let currentQualityPreset = "720p";
+      let torchEnabled = false;
+      let pollTimer = null;
       let answerApplied = false;
       let offerPosted = false;
       let queuedCandidates = [];
@@ -105,6 +189,154 @@
           candidate.sdpMid || "",
           candidate.sdpMLineIndex ?? ""
         ].join("|");
+      }
+
+      function setStatus(message, className) {
+        status.textContent = message;
+        status.className = className || "small";
+      }
+
+      function getQualityConstraints(preset) {
+        if (preset === "low") {
+          return {
+            width: { ideal: 640 },
+            height: { ideal: 360 },
+            frameRate: { ideal: 24, max: 30 }
+          };
+        }
+
+        if (preset === "1080p") {
+          return {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30, max: 30 }
+          };
+        }
+
+        return {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, max: 30 }
+        };
+      }
+
+      function buildVideoConstraints() {
+        const constraints = getQualityConstraints(currentQualityPreset);
+        constraints.facingMode = { ideal: currentFacingMode };
+        return constraints;
+      }
+
+      function stopStream(stream) {
+        if (!stream) {
+          return;
+        }
+
+        stream.getTracks().forEach((track) => track.stop());
+      }
+
+      function getTrackCapabilities(track) {
+        if (!track || !track.getCapabilities) {
+          return {};
+        }
+
+        try {
+          return track.getCapabilities() || {};
+        } catch (error) {
+          return {};
+        }
+      }
+
+      function getTrackSettings(track) {
+        if (!track || !track.getSettings) {
+          return {};
+        }
+
+        try {
+          return track.getSettings() || {};
+        } catch (error) {
+          return {};
+        }
+      }
+
+      function refreshCameraControls() {
+        const capabilities = getTrackCapabilities(activeVideoTrack);
+        const settings = getTrackSettings(activeVideoTrack);
+        const zoom = capabilities.zoom;
+
+        controls.className = activeVideoTrack ? "controls visible" : "controls";
+        flipButton.disabled = !activeVideoTrack;
+        qualitySelect.disabled = !activeVideoTrack;
+        qualitySelect.value = currentQualityPreset;
+
+        if (zoom && typeof zoom.min === "number" && typeof zoom.max === "number") {
+          const step = typeof zoom.step === "number" && zoom.step > 0 ? zoom.step : 0.1;
+          zoomSlider.min = zoom.min;
+          zoomSlider.max = zoom.max;
+          zoomSlider.step = step;
+          zoomSlider.value = typeof settings.zoom === "number" ? settings.zoom : zoom.min;
+          zoomSlider.disabled = false;
+          zoomWrap.hidden = false;
+        } else {
+          zoomSlider.disabled = true;
+          zoomWrap.hidden = true;
+        }
+
+        if (capabilities.torch === true) {
+          torchButton.hidden = false;
+          torchButton.disabled = false;
+          torchButton.textContent = torchEnabled ? "Torch On" : "Torch Off";
+          torchButton.className = torchEnabled ? "toggle-on" : "secondary";
+        } else {
+          torchEnabled = false;
+          torchButton.hidden = true;
+          torchButton.disabled = true;
+          torchButton.textContent = "Torch Off";
+          torchButton.className = "secondary";
+        }
+      }
+
+      async function openCamera() {
+        return navigator.mediaDevices.getUserMedia({
+          video: buildVideoConstraints(),
+          audio: false
+        });
+      }
+
+      async function startOrRestartCamera(message) {
+        const oldStream = localStream;
+        let stream;
+
+        try {
+          stream = await openCamera();
+        } catch (error) {
+          setStatus("Camera setting failed: " + (error.message || error.name), "small err");
+          throw error;
+        }
+
+        const newTrack = stream.getVideoTracks()[0];
+
+        try {
+          if (videoSender && newTrack) {
+            await videoSender.replaceTrack(newTrack);
+          }
+        } catch (error) {
+          stopStream(stream);
+          setStatus("Camera setting failed: " + (error.message || error.name), "small err");
+          throw error;
+        }
+
+        localStream = stream;
+        activeVideoTrack = newTrack || null;
+        torchEnabled = false;
+        video.srcObject = stream;
+        stopStream(oldStream);
+        refreshCameraControls();
+
+        if (message) {
+          setStatus(message, "small ok");
+        }
+
+        return stream;
       }
 
       async function postSignal(payload) {
@@ -168,8 +400,7 @@
           if (state.answer && !answerApplied) {
             await peer.setRemoteDescription(state.answer);
             answerApplied = true;
-            status.textContent = "WebRTC connected. Session: " + session;
-            status.className = "small ok";
+            setStatus("WebRTC connected. Session: " + session, "small ok");
           }
 
           for (const candidate of state.desktopCandidates || []) {
@@ -181,47 +412,135 @@
             }
           }
         } catch (error) {
-          status.textContent = "Signal error: " + (error.message || error.name);
-          status.className = "small err";
+          setStatus("Signal error: " + (error.message || error.name), "small err");
         }
       }
+
+      async function applyZoom() {
+        if (!activeVideoTrack || !activeVideoTrack.applyConstraints) {
+          return;
+        }
+
+        try {
+          await activeVideoTrack.applyConstraints({
+            advanced: [{ zoom: Number(zoomSlider.value) }]
+          });
+          setStatus("Zoom changed.", "small ok");
+        } catch (error) {
+          setStatus("Camera setting failed: " + (error.message || error.name), "small err");
+          refreshCameraControls();
+        }
+      }
+
+      async function toggleTorch() {
+        const capabilities = getTrackCapabilities(activeVideoTrack);
+
+        if (!activeVideoTrack || !activeVideoTrack.applyConstraints || capabilities.torch !== true) {
+          setStatus("Torch is unsupported on this camera/browser.", "small");
+          refreshCameraControls();
+          return;
+        }
+
+        const nextTorch = !torchEnabled;
+
+        try {
+          await activeVideoTrack.applyConstraints({
+            advanced: [{ torch: nextTorch }]
+          });
+          torchEnabled = nextTorch;
+          refreshCameraControls();
+          setStatus(torchEnabled ? "Torch enabled." : "Torch disabled.", "small ok");
+        } catch (error) {
+          setStatus("Camera setting failed: " + (error.message || error.name), "small err");
+          refreshCameraControls();
+        }
+      }
+
+      flipButton.onclick = async () => {
+        if (!activeVideoTrack) {
+          return;
+        }
+
+        const previousFacingMode = currentFacingMode;
+        flipButton.disabled = true;
+        currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
+
+        try {
+          await startOrRestartCamera("Camera flipped.");
+        } catch (error) {
+          currentFacingMode = previousFacingMode;
+          try {
+            await startOrRestartCamera("Camera restored.");
+          } catch (restoreError) {
+            setStatus("Camera setting failed: " + (restoreError.message || restoreError.name), "small err");
+          }
+        } finally {
+          refreshCameraControls();
+        }
+      };
+
+      qualitySelect.onchange = async () => {
+        if (!activeVideoTrack) {
+          return;
+        }
+
+        const previousPreset = currentQualityPreset;
+        currentQualityPreset = qualitySelect.value;
+        qualitySelect.disabled = true;
+
+        try {
+          await startOrRestartCamera("Quality changed.");
+        } catch (error) {
+          currentQualityPreset = previousPreset;
+          qualitySelect.value = previousPreset;
+          try {
+            await startOrRestartCamera("Quality restored.");
+          } catch (restoreError) {
+            setStatus("Camera setting failed: " + (restoreError.message || restoreError.name), "small err");
+          }
+        } finally {
+          refreshCameraControls();
+        }
+      };
+
+      zoomSlider.oninput = () => {
+        window.clearTimeout(zoomSlider.applyTimer);
+        zoomSlider.applyTimer = window.setTimeout(applyZoom, 120);
+      };
+
+      torchButton.onclick = toggleTorch;
 
       button.onclick = async () => {
         try {
           button.disabled = true;
           button.textContent = "Starting";
-          status.textContent = "Opening camera.";
-          status.className = "small";
+          setStatus("Opening camera.", "small");
 
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: "environment",
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            },
-            audio: false
-          });
-
-          video.srcObject = stream;
+          const stream = await startOrRestartCamera();
 
           peer = new RTCPeerConnection({ iceServers });
           peer.oniceconnectionstatechange = () => {
-            status.textContent = "WebRTC " + peer.iceConnectionState + ". Session: " + session;
-            status.className = peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed"
+            setStatus(
+              "WebRTC " + peer.iceConnectionState + ". Session: " + session,
+              peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed"
               ? "small ok"
-              : "small";
+              : "small"
+            );
           };
           peer.onicecandidate = (event) => {
             if (event.candidate) {
               sendCandidate(event.candidate).catch((error) => {
-                status.textContent = "Candidate error: " + (error.message || error.name);
-                status.className = "small err";
+                setStatus("Candidate error: " + (error.message || error.name), "small err");
               });
             }
           };
 
           for (const track of stream.getTracks()) {
-            peer.addTrack(track, stream);
+            const sender = peer.addTrack(track, stream);
+
+            if (track.kind === "video") {
+              videoSender = sender;
+            }
           }
 
           const offer = await peer.createOffer();
@@ -236,14 +555,15 @@
           await flushQueuedCandidates();
 
           button.textContent = "Streaming";
-          status.textContent = "Waiting for desktop receiver. Session: " + session;
-          status.className = "small";
-          setInterval(pollDesktopAnswer, 700);
+          setStatus("Waiting for desktop receiver. Session: " + session, "small");
+
+          if (!pollTimer) {
+            pollTimer = setInterval(pollDesktopAnswer, 700);
+          }
         } catch (error) {
           button.disabled = false;
           button.textContent = "Start Camera";
-          status.textContent = "Camera/WebRTC error: " + (error.message || error.name);
-          status.className = "small err";
+          setStatus("Camera/WebRTC error: " + (error.message || error.name), "small err");
         }
       };
     </script>
