@@ -101,6 +101,7 @@
       let recorderStopGraceTimer = null;
       let pendingChunkReads = 0;
       let recorderBytesSent = 0;
+      let activeFloofRecordingTakeId = null;
       const addedPhoneCandidates = new Set();
 
       sessionLabel.textContent = session;
@@ -126,9 +127,78 @@
       }
 
       function emitToFloof(payload) {
+        if (payload && activeFloofRecordingTakeId !== null && payload.takeId === undefined) {
+          payload.takeId = activeFloofRecordingTakeId;
+        }
+
         if (window.__JUCE__ && window.__JUCE__.backend) {
           window.__JUCE__.backend.emitEvent("floofWebRtcVideo", payload);
         }
+      }
+
+      function normaliseTimestampMs(value) {
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          return null;
+        }
+
+        return value > 100000000000 ? value - performance.timeOrigin : value;
+      }
+
+      function validDurationMs(value) {
+        return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 2000;
+      }
+
+      function emitFrameTiming(metadata) {
+        const presentationMs = normaliseTimestampMs(metadata && metadata.presentationTime);
+        const captureMs = normaliseTimestampMs(metadata && metadata.captureTime);
+        const receiveMs = normaliseTimestampMs(metadata && metadata.receiveTime);
+        const captureToPresentMs = presentationMs !== null && captureMs !== null
+          ? presentationMs - captureMs
+          : null;
+        const receiveToPresentMs = presentationMs !== null && receiveMs !== null
+          ? presentationMs - receiveMs
+          : null;
+        let videoLatencyMs = validDurationMs(captureToPresentMs) ? captureToPresentMs : null;
+
+        if (videoLatencyMs === null && validDurationMs(receiveToPresentMs)) {
+          videoLatencyMs = receiveToPresentMs;
+        }
+
+        if (videoLatencyMs === null) {
+          return;
+        }
+
+        emitToFloof({
+          type: "timing",
+          source: "requestVideoFrameCallback",
+          videoLatencyMs,
+          captureToPresentMs,
+          receiveToPresentMs,
+          mediaTimeSeconds: typeof metadata.mediaTime === "number" ? metadata.mediaTime : null,
+          presentedFrames: typeof metadata.presentedFrames === "number" ? metadata.presentedFrames : null
+        });
+      }
+
+      function samplePhoneSyncFrames() {
+        if (!remote || typeof remote.requestVideoFrameCallback !== "function") {
+          emitToFloof({
+            type: "timingUnavailable",
+            reason: !remote ? "video element not found" : "requestVideoFrameCallback unavailable"
+          });
+          return;
+        }
+
+        let samplesRemaining = 24;
+        const onFrame = (_now, metadata) => {
+          emitFrameTiming(metadata || {});
+          samplesRemaining -= 1;
+
+          if (samplesRemaining > 0) {
+            remote.requestVideoFrameCallback(onFrame);
+          }
+        };
+
+        remote.requestVideoFrameCallback(onFrame);
       }
 
       function getRecorderMimeType() {
@@ -160,6 +230,7 @@
         mediaRecorder = null;
         setStatus("WebRTC video saved.", "ok");
         emitToFloof({ type: "stopped", bytes: recorderBytesSent });
+        activeFloofRecordingTakeId = null;
       }
 
       function scheduleRecorderStopped() {
@@ -185,8 +256,13 @@
         return null;
       }
 
-      window.floofStartWebRtcRecording = () => {
+      window.floofStartWebRtcRecording = (takeId = null) => {
         try {
+          const numericTakeId = Number(takeId);
+          activeFloofRecordingTakeId = Number.isFinite(numericTakeId) && numericTakeId > 0
+            ? numericTakeId
+            : null;
+
           const streamToRecord = getActiveRemoteStream();
 
           if (!streamToRecord) {
@@ -220,6 +296,7 @@
           }
           pendingChunkReads = 0;
           recorderBytesSent = 0;
+          samplePhoneSyncFrames();
 
           mediaRecorder.ondataavailable = (event) => {
             if (!event.data || event.data.size === 0) {
@@ -267,16 +344,20 @@
               type: "error",
               message: event.error ? event.error.message : "MediaRecorder error"
             });
+            activeFloofRecordingTakeId = null;
           };
 
           mediaRecorder.start(1000);
           setStatus("Recording WebRTC video.", "ok");
           emitToFloof({ type: "started" });
+          setTimeout(samplePhoneSyncFrames, 120);
+          setTimeout(samplePhoneSyncFrames, 600);
         } catch (error) {
           emitToFloof({
             type: "error",
             message: error.message || error.name
           });
+          activeFloofRecordingTakeId = null;
         }
       };
 
@@ -285,6 +366,7 @@
           if (!mediaRecorder || mediaRecorder.state === "inactive") {
             recorderStopRequested = false;
             emitToFloof({ type: "stopped", bytes: recorderBytesSent });
+            activeFloofRecordingTakeId = null;
             return;
           }
 
@@ -295,6 +377,7 @@
             type: "error",
             message: error.message || error.name
           });
+          activeFloofRecordingTakeId = null;
         }
       };
 
