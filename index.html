@@ -12,15 +12,17 @@
         color: #f4f7f8;
         display: grid;
         min-height: 100vh;
-        place-items: center;
+        place-items: start center;
+        padding: 16px 0 20px;
+        box-sizing: border-box;
       }
 
       main {
-        width: min(520px, calc(100vw - 32px));
+        width: min(520px, calc(100vw - 24px));
         background: #171717;
         border: 1px solid #2b2b2b;
         border-radius: 14px;
-        padding: 24px;
+        padding: 18px;
         box-sizing: border-box;
       }
 
@@ -28,7 +30,7 @@
         width: 100%;
         background: #050505;
         border-radius: 10px;
-        margin: 12px 0;
+        margin: 8px 0;
       }
 
       button {
@@ -41,6 +43,10 @@
         font-weight: 700;
         padding: 14px 18px;
         width: 100%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
       }
 
       button.secondary {
@@ -62,8 +68,9 @@
       .controls {
         display: none;
         gap: 12px;
-        margin: 12px 0;
+        margin: 8px 0;
       }
+
 
       .controls.visible {
         display: grid;
@@ -131,7 +138,6 @@
   <body>
     <main>
       <h1>floof</h1>
-      <p>Start the camera to stream to the floof WebRTC receiver on your computer.</p>
       <video id="preview" autoplay muted playsinline></video>
       <div id="controls" class="controls" aria-label="Camera controls">
         <button id="flip" class="secondary" type="button">Flip Camera</button>
