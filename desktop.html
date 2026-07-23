@@ -88,6 +88,7 @@
       <p id="status">Waiting. Session: <code id="session"></code></p>
     </main>
 
+    <script src="/recorder-protocol.js"></script>
     <script>
       const params = new URLSearchParams(window.location.search);
       const session = params.get("session") || params.get("s") || "manual";
@@ -105,11 +106,22 @@
       let remoteStream = null;
       let mediaRecorder = null;
       let recorderStopRequested = false;
-      let recorderStopGraceTimer = null;
       let pendingChunkReads = 0;
       let recorderBytesSent = 0;
+      let nextRecorderChunkSequence = 0;
+      let recorderStartedAtMs = 0;
+      let firstRecorderMediaTimeSeconds = null;
+      let lastRecorderMediaTimeSeconds = null;
+      let lastObservedCaptureTimeMs = null;
+      let recorderFrameIntervalsSeconds = [];
+      let recorderFrameMonitorActive = false;
+      let pendingCaptureBoundaryStop = null;
+      let captureBoundaryFallbackTimer = null;
+      let captureBoundaryHardTimer = null;
       let activeFloofRecordingTakeId = null;
       const addedPhoneCandidates = new Set();
+
+      window.floofRecorderProtocolVersion = 2;
 
       sessionLabel.textContent = session;
 
@@ -229,26 +241,92 @@
           return;
         }
 
-        if (recorderStopGraceTimer) {
-          return;
-        }
-
+        const timing = window.FloofRecorderProtocol.calculateDuration(
+          firstRecorderMediaTimeSeconds,
+          lastRecorderMediaTimeSeconds,
+          recorderFrameIntervalsSeconds,
+          (performance.now() - recorderStartedAtMs) / 1000
+        );
         recorderStopRequested = false;
         mediaRecorder = null;
         setStatus("WebRTC video saved.", "ok");
-        emitToFloof({ type: "stopped", bytes: recorderBytesSent });
+        emitToFloof({
+          type: "stopped",
+          chunkCount: nextRecorderChunkSequence,
+          bytes: recorderBytesSent,
+          sourceDurationSeconds: timing.sourceDurationSeconds,
+          finalFrameIntervalSeconds: timing.finalFrameIntervalSeconds
+        });
         activeFloofRecordingTakeId = null;
       }
 
-      function scheduleRecorderStopped() {
-        if (recorderStopGraceTimer) {
-          clearTimeout(recorderStopGraceTimer);
+      function clearCaptureBoundaryTimers() {
+        if (captureBoundaryFallbackTimer) {
+          clearTimeout(captureBoundaryFallbackTimer);
+          captureBoundaryFallbackTimer = null;
+        }
+        if (captureBoundaryHardTimer) {
+          clearTimeout(captureBoundaryHardTimer);
+          captureBoundaryHardTimer = null;
+        }
+      }
+
+      function stopMediaRecorderNow() {
+        pendingCaptureBoundaryStop = null;
+        clearCaptureBoundaryTimers();
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
+      }
+
+      function observeRecorderFrame(_now, metadata = {}) {
+        if (!mediaRecorder || mediaRecorder.state === "inactive") {
+          recorderFrameMonitorActive = false;
+          return;
         }
 
-        recorderStopGraceTimer = setTimeout(() => {
-          recorderStopGraceTimer = null;
-          maybeEmitRecorderStopped();
-        }, 750);
+        const mediaTime = Number(metadata.mediaTime);
+        if (Number.isFinite(mediaTime)) {
+          if (firstRecorderMediaTimeSeconds === null) {
+            firstRecorderMediaTimeSeconds = mediaTime;
+          }
+          if (lastRecorderMediaTimeSeconds !== null) {
+            const interval = mediaTime - lastRecorderMediaTimeSeconds;
+            if (interval > 0 && interval < 1) {
+              recorderFrameIntervalsSeconds.push(interval);
+              if (recorderFrameIntervalsSeconds.length > 61) {
+                recorderFrameIntervalsSeconds.shift();
+              }
+            }
+          }
+          lastRecorderMediaTimeSeconds = mediaTime;
+        }
+
+        const captureTimeMs = normaliseTimestampMs(metadata.captureTime);
+        if (captureTimeMs !== null) {
+          lastObservedCaptureTimeMs = captureTimeMs;
+        }
+
+        if (pendingCaptureBoundaryStop
+            && window.FloofRecorderProtocol.captureBoundaryReached(
+              captureTimeMs,
+              pendingCaptureBoundaryStop.targetCaptureTimeMs
+            )) {
+          stopMediaRecorderNow();
+          return;
+        }
+
+        remote.requestVideoFrameCallback(observeRecorderFrame);
+      }
+
+      function beginRecorderFrameMonitor() {
+        if (recorderFrameMonitorActive
+            || !remote
+            || typeof remote.requestVideoFrameCallback !== "function") {
+          return;
+        }
+        recorderFrameMonitorActive = true;
+        remote.requestVideoFrameCallback(observeRecorderFrame);
       }
 
       function getActiveRemoteStream() {
@@ -297,12 +375,16 @@
             ? new MediaRecorder(streamToRecord, { mimeType })
             : new MediaRecorder(streamToRecord);
           recorderStopRequested = false;
-          if (recorderStopGraceTimer) {
-            clearTimeout(recorderStopGraceTimer);
-            recorderStopGraceTimer = null;
-          }
+          clearCaptureBoundaryTimers();
+          pendingCaptureBoundaryStop = null;
           pendingChunkReads = 0;
           recorderBytesSent = 0;
+          nextRecorderChunkSequence = 0;
+          recorderStartedAtMs = performance.now();
+          firstRecorderMediaTimeSeconds = null;
+          lastRecorderMediaTimeSeconds = null;
+          lastObservedCaptureTimeMs = null;
+          recorderFrameIntervalsSeconds = [];
           samplePhoneSyncFrames();
 
           mediaRecorder.ondataavailable = (event) => {
@@ -311,6 +393,7 @@
             }
 
             recorderBytesSent += event.data.size;
+            const sequence = nextRecorderChunkSequence++;
             pendingChunkReads += 1;
             const reader = new FileReader();
             reader.onload = () => {
@@ -318,6 +401,7 @@
               const commaIndex = result.indexOf(",");
               emitToFloof({
                 type: "chunk",
+                sequence,
                 data: commaIndex >= 0 ? result.slice(commaIndex + 1) : result
               });
               pendingChunkReads -= 1;
@@ -337,15 +421,13 @@
           mediaRecorder.onstop = () => {
             recorderStopRequested = true;
             setStatus("Finishing WebRTC video.", "ok");
-            scheduleRecorderStopped();
+            maybeEmitRecorderStopped();
           };
 
           mediaRecorder.onerror = (event) => {
             recorderStopRequested = false;
-            if (recorderStopGraceTimer) {
-              clearTimeout(recorderStopGraceTimer);
-              recorderStopGraceTimer = null;
-            }
+            pendingCaptureBoundaryStop = null;
+            clearCaptureBoundaryTimers();
             mediaRecorder = null;
             emitToFloof({
               type: "error",
@@ -355,6 +437,7 @@
           };
 
           mediaRecorder.start(1000);
+          beginRecorderFrameMonitor();
           setStatus("Recording WebRTC video.", "ok");
           emitToFloof({ type: "started" });
           setTimeout(samplePhoneSyncFrames, 120);
@@ -368,17 +451,51 @@
         }
       };
 
-      window.floofStopWebRtcRecording = () => {
+      window.floofStopWebRtcRecording = (options = {}) => {
         try {
           if (!mediaRecorder || mediaRecorder.state === "inactive") {
             recorderStopRequested = false;
-            emitToFloof({ type: "stopped", bytes: recorderBytesSent });
+            emitToFloof({
+              type: "stopped",
+              chunkCount: nextRecorderChunkSequence,
+              bytes: recorderBytesSent,
+              sourceDurationSeconds: Math.max(0, (performance.now() - recorderStartedAtMs) / 1000),
+              finalFrameIntervalSeconds: 0
+            });
             activeFloofRecordingTakeId = null;
             return;
           }
 
-          mediaRecorder.requestData();
-          mediaRecorder.stop();
+          if (!options || options.waitForCaptureBoundary !== true) {
+            stopMediaRecorderNow();
+            return;
+          }
+
+          const requestedAtMs = performance.now();
+          const estimatedFrameIntervalMs = window.FloofRecorderProtocol
+            .medianFrameInterval(recorderFrameIntervalsSeconds) * 1000;
+          const fallbackDelayMs = Number.isFinite(Number(options.fallbackDelayMs))
+            ? Math.max(0, Math.min(1900, Number(options.fallbackDelayMs) + 2 * estimatedFrameIntervalMs))
+            : Math.min(1900, 100 + 2 * estimatedFrameIntervalMs);
+          pendingCaptureBoundaryStop = { targetCaptureTimeMs: requestedAtMs };
+
+          captureBoundaryFallbackTimer = setTimeout(() => {
+            captureBoundaryFallbackTimer = null;
+            if (pendingCaptureBoundaryStop && lastObservedCaptureTimeMs === null) {
+              stopMediaRecorderNow();
+            }
+          }, fallbackDelayMs);
+          captureBoundaryHardTimer = setTimeout(() => {
+            captureBoundaryHardTimer = null;
+            if (pendingCaptureBoundaryStop) {
+              stopMediaRecorderNow();
+            }
+          }, 2000);
+
+          if (!remote || typeof remote.requestVideoFrameCallback !== "function") {
+            return;
+          }
+          beginRecorderFrameMonitor();
         } catch (error) {
           emitToFloof({
             type: "error",

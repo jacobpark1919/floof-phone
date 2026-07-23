@@ -5,7 +5,8 @@ This is the prototype HTTPS phone camera/WebRTC pairing site for `floof`.
 It is designed for Vercel:
 
 - `index.html` opens the iPhone camera over HTTPS and sends it with WebRTC
-- `desktop.html` receives and displays the WebRTC stream on the computer
+- `desktop.html` receives the WebRTC stream and emits ordered protocol-2 recording chunks to floof
+- `recorder-protocol.js` provides shared recording-duration and capture-boundary calculations
 - `api/signal.js` stores temporary WebRTC offer/answer/ICE signaling messages
 - `api/frame.js` is the older JPEG relay fallback/prototype endpoint
 - `package.json` installs Vercel's KV client for serverless signaling storage
@@ -55,6 +56,14 @@ After deployment, the desktop app expects:
 https://floof-phone.vercel.app
 ```
 
+Before distributing a native build that requires recorder protocol 2, verify in the deployed receiver console:
+
+```js
+window.floofRecorderProtocolVersion
+```
+
+It must return `2`. Run the receiver protocol tests with `npm test` before deployment.
+
 If your Vercel URL changes, update `phoneCloudBaseUrl` in `src/MainComponent.cpp`.
 
 ## WebRTC Flow
@@ -65,4 +74,4 @@ If your Vercel URL changes, update `phoneCloudBaseUrl` in `src/MainComponent.cpp
 4. Tap `Start Camera`.
 5. Click `Start Receiver` in the desktop browser page if it has not already started.
 
-This first WebRTC milestone previews the phone camera in the browser receiver. It does not yet pipe decoded video frames into JUCE or record phone video into floof's timeline.
+The embedded receiver records the remote stream with `MediaRecorder`. It assigns chunk sequence numbers before asynchronous reads, waits for the final `dataavailable` event and all reads, and then sends integrity and duration metadata to the native app for local storage and timeline insertion.
